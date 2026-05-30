@@ -1,0 +1,52 @@
+from __future__ import annotations
+from pathlib import Path
+import typer
+from rich.console import Console
+from .agent import run_agent
+from .model import MockProvider
+from .tools import default_tools
+
+console = Console()
+app = typer.Typer(add_completion=False)
+
+def render_header(cwd: Path) -> None:
+    console.print("[bold]bemoCode[/bold]")
+    console.print(f"[dim]cwd: {cwd}[/dim]\n")
+
+def handle_slash(line: str) -> bool:
+    if line == "/help":
+        console.print("可用命令：/help, /exit")
+        return True
+    return False
+
+def run_once(prompt: str, cwd: Path) -> None:
+    render_header(cwd)
+    result = run_agent(prompt, MockProvider(), default_tools())
+    for line in result.trace:
+        console.print(line)
+
+@app.callback(invoke_without_command=True)
+def main_command(
+    prompt: str = typer.Argument("", help="Prompt to send to the agent."),
+    cwd: Path = typer.Option(Path.cwd(), "--cwd", "-C"),
+) -> None:
+    resolved_cwd = cwd.resolve()
+    text = prompt.strip()
+    if text:
+        run_once(text, resolved_cwd)
+        return
+    render_header(resolved_cwd)
+    console.print("输入 /help 查看命令，输入 /exit 退出。")
+    while True:
+        line = typer.prompt(">").strip()
+        if not line:
+            continue
+        if line == "/exit":
+            console.print("Bye.")
+            return
+        if line.startswith("/") and handle_slash(line):
+            continue
+        run_once(line, resolved_cwd)
+
+def main() -> None:
+    app()

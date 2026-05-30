@@ -1,0 +1,25 @@
+[project]
+name = "bemocode"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "qiumengbo.123", email = "qiumengbo.123@jd.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "rich>=13.7.0",
+    "typer>=0.12.0",
+]
+
+[project.scripts]
+bemocode = "bemocode.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.8,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
