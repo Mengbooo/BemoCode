@@ -90,4 +90,3 @@ def show_banner(
 
     console.print()
     console.print(banner)
-    console.print("─" * 78, style="dim")
