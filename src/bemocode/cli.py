@@ -10,6 +10,7 @@ from .agent import build_system_prompt, run_agent
 from .model import create_provider
 from .session import Session
 from .slash import SlashContext, dispatch_slash
+from .startup import show_banner
 from .tools import default_tools
 
 load_dotenv()
@@ -17,24 +18,6 @@ load_dotenv()
 console = Console()
 app = typer.Typer(add_completion=False)
 tools = default_tools()
-
-
-def render_header(
-    cwd: Path,
-    provider: str,
-    model: str,
-    base_url: str | None = None,
-    session: Session | None = None,
-) -> None:
-    console.print("[bold]bemoCode[/bold]")
-    console.print(f"[dim]cwd: {cwd}[/dim]")
-    console.print(f"[dim]provider: {provider}  model: {model}[/dim]")
-    if base_url:
-        console.print(f"[dim]base_url: {base_url}[/dim]")
-    if session:
-        tag = "(resumed)" if session.resumed else ""
-        console.print(f"[dim]session: {session.session_id} {tag}[/dim]")
-    console.print()
 
 
 def handle_slash(line: str) -> bool:
@@ -58,7 +41,6 @@ def run_once(
     session: Session | None = None,
     system_prompt: str | None = None,
 ) -> None:
-    render_header(cwd, provider, model, base_url, session)
     os.chdir(cwd)
     prov = create_provider(provider, model, base_url)
     run_agent(
@@ -104,12 +86,14 @@ def main_command(
     system_prompt = build_system_prompt(resolved_cwd)
 
     if text:
+        show_banner(resolved_cwd, provider, model, base_url, session,
+                    permission_mode, tool_count=len(tools.list_tools()))
         run_once(text, resolved_cwd, provider, model, base_url, max_steps,
                  permission_mode, session=session, system_prompt=system_prompt)
         return
 
-    render_header(resolved_cwd, provider, model, base_url, session)
-    console.print("输入 /help 查看命令，输入 /exit 退出。")
+    show_banner(resolved_cwd, provider, model, base_url, session,
+                permission_mode, tool_count=len(tools.list_tools()))
     while True:
         line = typer.prompt(">").strip()
         if not line:
