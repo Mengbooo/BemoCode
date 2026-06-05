@@ -22,6 +22,7 @@ from .fs_safety import (
     should_skip,
     truncate_output,
 )
+from .bash_runner import run_sync as _bash_run_sync
 from .file_history import backup
 from .model import ToolCall, ToolResult
 
@@ -241,6 +242,52 @@ def file_edit(args: dict[str, Any], ctx: ToolContext) -> str:
     path.write_text(new_content, encoding="utf-8")
     ctx.read_state.record(path, new_content)
     return f"Edited {path_str}: replaced {len(old_string)} chars with {len(new_string)} chars"
+
+
+# ── Bash / Git 工具 ────────────────────────────────────────
+
+
+def bash(args: dict[str, Any], ctx: ToolContext) -> str:
+    """Execute a shell command. Pre-checks and user confirmation handled in agent.py interceptor."""
+    command = args.get("command", "")
+    if not command:
+        return "error: missing required argument 'command'"
+    timeout = int(args.get("timeout", 30))
+    background = bool(args.get("background", False))
+
+    if background:
+        from .bg_manager import start_background
+        result = start_background(command, ctx.cwd)
+        return (
+            f"Command running in background with ID: {result['background_id']}.\n"
+            f"Output is being written to: {result['output_file']}\n"
+            f"Stderr is being written to: {result['stderr_file']}\n"
+            f"PID: {result['pid']}\n\n"
+            f"{result['message']}"
+        )
+
+    return _bash_run_sync(command, ctx.cwd, timeout=timeout)
+
+
+def git_status(args: dict[str, Any], ctx: ToolContext) -> str:
+    """Run git status in the project directory (read-only)."""
+    return _bash_run_sync("git status", ctx.cwd, timeout=10)
+
+
+def git_diff(args: dict[str, Any], ctx: ToolContext) -> str:
+    """Run git diff in the project directory (read-only)."""
+    return _bash_run_sync("git diff", ctx.cwd, timeout=10)
+
+
+def _ask_user_question(args: dict[str, Any], ctx: ToolContext) -> str:
+    """Handled by agent.py interceptor — this function never reads stdin directly."""
+    prompt = args.get("prompt", "")
+    options = args.get("options", [])
+    if not prompt:
+        return "error: missing required argument 'prompt'"
+    if not options or not isinstance(options, list):
+        return "error: options must be a non-empty list"
+    return "error: ask_user_question must be handled by the harness, not executed directly"
 
 
 # ── 项目树工具 ────────────────────────────────────────────
@@ -597,6 +644,63 @@ def default_tools() -> ToolRegistry:
                     },
                 },
                 "required": ["file_path", "old_string", "new_string"],
+            },
+        )
+    )
+    registry.register(
+        Tool(
+            name="bash",
+            description="Execute a shell command in the project directory.",
+            run=bash,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The shell command to execute"},
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds, default 30",
+                        "default": 30,
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Run in background, default false",
+                        "default": False,
+                    },
+                },
+                "required": ["command"],
+            },
+        )
+    )
+    registry.register(
+        Tool(
+            name="git_status",
+            description="Run git status in the project directory (read-only).",
+            run=git_status,
+        )
+    )
+    registry.register(
+        Tool(
+            name="git_diff",
+            description="Run git diff in the project directory (read-only).",
+            run=git_diff,
+        )
+    )
+    registry.register(
+        Tool(
+            name="ask_user_question",
+            description="Ask the user a question with a list of options to choose from.",
+            run=_ask_user_question,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "The question to ask the user"},
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of options for the user to choose from",
+                    },
+                },
+                "required": ["prompt", "options"],
             },
         )
     )

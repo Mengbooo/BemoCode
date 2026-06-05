@@ -5,7 +5,6 @@ from typing import Any
 
 from rich.console import Console
 
-from .diff_ui import confirm_edit, render_diff
 from .fs_safety import (
     SkipPolicy,
     apply_single_replace,
@@ -15,6 +14,14 @@ from .fs_safety import (
     resolve_in_cwd,
 )
 from .model import ModelProvider, ModelResponse
+from .permissions import PermissionRequest, decide_permission
+from .prompt_ui import (
+    confirm_command,
+    confirm_edit,
+    confirm_tool_use,
+    prompt_single_choice,
+    render_diff,
+)
 from .tools import ToolContext, ToolRegistry, ToolResult
 
 
@@ -62,6 +69,7 @@ def run_agent(
     tools: ToolRegistry,
     max_steps: int = 8,
     cwd: Path | None = None,
+    permission_mode: str = "default",
 ) -> AgentResult:
     resolved_cwd = cwd or Path.cwd()
     ctx = ToolContext(
@@ -89,11 +97,23 @@ def run_agent(
         for call in response.tool_calls:
             emit(f"tool_call: {call.name} {call.arguments}")
 
-            # ── Day 4: 写工具拦截块 ──────────────────────────
-            if call.name in ("file_write", "file_edit"):
+            # ── Day 5: unified permission gate ──────────────────
+            request = PermissionRequest(
+                tool_name=call.name,
+                args=call.arguments,
+                mode=permission_mode,
+                cwd=ctx.cwd,
+            )
+            decision = decide_permission(request)
+
+            # Edit preview: for file_write/file_edit, run Day 4 safety
+            # checks regardless of mode (acceptEdits skips CONFIRMATION,
+            # not validation). Compute old/new content + validation errors.
+            edit_preview: tuple[str, str, str] | None = None  # (path_str, old, new)
+            if call.name in ("file_write", "file_edit") and decision.behavior != "deny":
                 path_str = call.arguments.get("file_path", "")
 
-                # 1) Path resolution — out-of-bounds 变成 error
+                # 1) Path resolution — out-of-bounds is an error
                 try:
                     path = resolve_in_cwd(ctx.cwd, path_str)
                 except (ValueError, OSError) as exc:
@@ -152,8 +172,24 @@ def run_agent(
                     })
                     continue
 
-                # 5) Passed validation → render diff + user confirmation
-                if new_content is not None:
+                # Store preview for ask/allow branches
+                edit_preview = (path_str, old_content, new_content or "")
+
+            # ── Permission branches ─────────────────────────────
+            if decision.behavior == "deny":
+                result = ToolResult(call.id, f"error: {decision.message}", is_error=True)
+                emit(f"observation: {result.content}")
+                tool_result_blocks.append({
+                    "type": "tool_result",
+                    "tool_use_id": result.tool_call_id,
+                    "content": result.content,
+                    "is_error": True,
+                })
+                continue
+
+            elif decision.behavior == "ask":
+                if call.name in ("file_write", "file_edit") and edit_preview is not None:
+                    path_str, old_content, new_content = edit_preview
                     diff_text = render_diff(old_content, new_content, path_str)
                     console.print(f"\n[bold]Diff for {path_str}:[/bold]")
                     console.print(diff_text)
@@ -167,6 +203,54 @@ def run_agent(
                             "is_error": True,
                         })
                         continue
+
+                elif call.name == "bash":
+                    command = call.arguments.get("command", "")
+                    timeout = call.arguments.get("timeout", 30)
+                    console.print(f"\n[bold yellow]Command:[/bold yellow] {command}")
+                    console.print(f"[dim]timeout: {timeout}s  cwd: {ctx.cwd}[/dim]")
+                    if not confirm_command(command):
+                        result = ToolResult(call.id, "error: command rejected by user", is_error=True)
+                        emit(f"observation: {result.content}")
+                        tool_result_blocks.append({
+                            "type": "tool_result",
+                            "tool_use_id": result.tool_call_id,
+                            "content": result.content,
+                            "is_error": True,
+                        })
+                        continue
+
+                elif call.name in ("web_fetch", "web_search"):
+                    if not confirm_tool_use(call.name, call.arguments):
+                        result = ToolResult(call.id, "error: tool use rejected by user", is_error=True)
+                        emit(f"observation: {result.content}")
+                        tool_result_blocks.append({
+                            "type": "tool_result",
+                            "tool_use_id": result.tool_call_id,
+                            "content": result.content,
+                            "is_error": True,
+                        })
+                        continue
+
+                elif call.name == "ask_user_question":
+                    question = call.arguments.get("prompt", "")
+                    options = call.arguments.get("options", [])
+                    if not isinstance(options, list):
+                        options = []
+                    labels = [str(o) for o in options]
+                    selected = prompt_single_choice(question, labels)
+                    if selected is None:
+                        result = ToolResult(call.id, "User skipped the question.", is_error=False)
+                    else:
+                        result = ToolResult(call.id, f'User selected: "{selected}"', is_error=False)
+                    emit(f"observation: {result.content}")
+                    tool_result_blocks.append({
+                        "type": "tool_result",
+                        "tool_use_id": result.tool_call_id,
+                        "content": result.content,
+                        "is_error": result.is_error,
+                    })
+                    continue
 
             # ── 执行工具 ──────────────────────────────────────
             result = tools.run(call, ctx)

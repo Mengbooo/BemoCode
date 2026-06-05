@@ -83,6 +83,7 @@ def _mock_args_for(tool_name: str, text: str) -> dict[str, Any]:
     search_tools = {"grep"}
     web_tools = {"web_fetch", "web_search"}
     edit_tools = {"file_write", "file_edit"}
+    bash_tools = {"bash", "git_status", "git_diff"}
     if tool_name in path_tools:
         return {"path": "."}
     if tool_name == "glob":
@@ -97,6 +98,10 @@ def _mock_args_for(tool_name: str, text: str) -> dict[str, Any]:
         return {"query": "hello"}
     if tool_name in edit_tools:
         return {"file_path": "test.txt", "content": "hello", "old_string": "hello", "new_string": "world"}
+    if tool_name == "bash":
+        return {"command": "echo hello"}
+    if tool_name == "ask_user_question":
+        return {"prompt": "What should I do?", "options": ["Option A", "Option B"]}
     return {"text": text}
 
 

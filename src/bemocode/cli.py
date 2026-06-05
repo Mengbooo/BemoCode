@@ -43,11 +43,12 @@ def run_once(
     model: str,
     base_url: str | None,
     max_steps: int,
+    permission_mode: str = "default",
 ) -> None:
     render_header(cwd, provider, model, base_url)
     os.chdir(cwd)
     prov = create_provider(provider, model, base_url)
-    run_agent(prompt, prov, tools, max_steps=max_steps, cwd=cwd)
+    run_agent(prompt, prov, tools, max_steps=max_steps, cwd=cwd, permission_mode=permission_mode)
 
 
 @app.callback(invoke_without_command=True)
@@ -58,11 +59,15 @@ def main_command(
     model: str = typer.Option("deepseek-v4-flash", "--model"),
     base_url: str | None = typer.Option(None, "--base-url"),
     max_steps: int = typer.Option(8, "--max-steps"),
+    permission_mode: str = typer.Option(
+        "default", "--permission-mode",
+        help="Permission mode: default, acceptEdits, plan",
+    ),
 ) -> None:
     resolved_cwd = cwd.resolve()
     text = prompt.strip()
     if text:
-        run_once(text, resolved_cwd, provider, model, base_url, max_steps)
+        run_once(text, resolved_cwd, provider, model, base_url, max_steps, permission_mode)
         return
     render_header(resolved_cwd, provider, model, base_url)
     console.print("输入 /help 查看命令，输入 /exit 退出。")
@@ -75,7 +80,7 @@ def main_command(
             return
         if line.startswith("/") and handle_slash(line):
             continue
-        run_once(line, resolved_cwd, provider, model, base_url, max_steps)
+        run_once(line, resolved_cwd, provider, model, base_url, max_steps, permission_mode)
 
 
 def main() -> None:
