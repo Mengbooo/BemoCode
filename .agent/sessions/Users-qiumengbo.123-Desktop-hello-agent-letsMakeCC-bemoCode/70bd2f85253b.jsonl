@@ -1,4 +1,0 @@
-{"role":"user","content":"用 echo 工具说 hello world","timestamp":"2026-06-05T09:20:28.452923+00:00"}
-{"role":"assistant","content":[{"type":"tool_use","id":"call_echo_1","name":"echo","input":{"text":"用 echo 工具说 hello world"}}],"timestamp":"2026-06-05T09:20:28.453365+00:00"}
-{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_echo_1","content":"用 echo 工具说 hello world","is_error":false}],"timestamp":"2026-06-05T09:20:28.453890+00:00"}
-{"role":"assistant","content":[{"type":"text","text":"echo 工具返回：用 echo 工具说 hello world"}],"timestamp":"2026-06-05T09:20:28.454009+00:00"}
