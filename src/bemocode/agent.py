@@ -93,7 +93,7 @@ def _tool_result_message(tool_call_id: str, content: str, is_error: bool = False
 
 
 def _emit_styled(console: Console, line: str) -> None:
-    """美化 agent trace 输出：用彩色分割线区分不同消息类型。"""
+    """美化 agent trace 输出：用分割线区分不同消息类型。"""
     from rich.markdown import Markdown
     from rich.text import Text
 
@@ -104,38 +104,37 @@ def _emit_styled(console: Console, line: str) -> None:
         args_str = parts[1] if len(parts) > 1 else ""
 
         console.print()
-        # 分割线：工具名
-        _sep(console, f"Agent · {tool_name}", style="yellow")
+        _sep(console, f"Agent · {tool_name}", style="dim")
         if args_str:
             display_args = args_str if len(args_str) <= 200 else args_str[:200] + "..."
             console.print(f"  {display_args}", style="dim")
 
     elif line.startswith("observation:"):
         rest = line[len("observation:"):].strip()
-        _sep(console, "result", style="dim green")
+        _sep(console, "result", style="dim")
         if len(rest) > 400:
             rest = rest[:400] + "..."
-        console.print(f"  {rest}", style="italic dim")
+        console.print(f"  {rest}", style="dim")
 
     elif line.startswith("final:"):
         rest = line[len("final:"):].strip()
         if not rest:
             return
         console.print()
-        _sep(console, "Agent", style="bright_green")
+        _sep(console, "Agent", style="bold")
         console.print()
         md = Markdown(rest, code_theme="monokai")
         console.print(md)
         console.print()
 
     elif line.startswith("interrupted"):
-        _sep(console, "interrupted", style="yellow")
-        console.print(f"  {line}", style="yellow")
+        _sep(console, "interrupted", style="dim")
+        console.print(f"  {line}", style="dim")
 
     elif line.startswith("continue:"):
         rest = line[len("continue:"):].strip()
-        _sep(console, "continue", style="dim cyan")
-        console.print(f"  {rest}", style="dim cyan")
+        _sep(console, "continue", style="dim")
+        console.print(f"  {rest}", style="dim")
 
     elif line.startswith("compacted"):
         console.print(f"  ⊟ {line}", style="dim")
@@ -148,11 +147,10 @@ def _sep(console: Console, label: str, style: str = "dim") -> None:
     """画一条带标签的分割线。"""
     width = console.width or 78
     label_text = f"  {label}  "
-    # 用 rich Text 保证颜色正确
     from rich.text import Text
     line = Text()
     line.append("─" * 4, style=style)
-    line.append(label_text, style=f"bold {style}")
+    line.append(label_text, style=f"bold {style}" if style != "dim" else "bold")
     remaining = width - 4 - len(label_text)
     if remaining > 0:
         line.append("─" * remaining, style=style)

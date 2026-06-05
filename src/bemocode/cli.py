@@ -25,9 +25,9 @@ def _user_sep(console: Console) -> None:
     from rich.text import Text
     width = console.width or 78
     line = Text()
-    line.append("───", style="bold bright_cyan")
-    line.append(" You ", style="bold white on bright_cyan")
-    line.append("─" * max(0, width - 8), style="bright_cyan")
+    line.append("───", style="bold")
+    line.append(" You ", style="reverse bold")
+    line.append("─" * max(0, width - 8), style="dim")
     console.print(line)
 
 
