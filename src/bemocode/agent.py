@@ -5,6 +5,8 @@ from typing import Any
 
 from rich.console import Console
 
+from .compact_basic import compact as _compact_messages
+from .hooks import run_hooks
 from .fs_safety import (
     SkipPolicy,
     apply_single_replace,
@@ -15,14 +17,41 @@ from .fs_safety import (
 )
 from .model import ModelProvider, ModelResponse
 from .permissions import PermissionRequest, decide_permission
+from .project_memory import load_agent_md
 from .prompt_ui import (
     confirm_command,
     confirm_edit,
+    confirm_plan,
     confirm_tool_use,
     prompt_single_choice,
     render_diff,
 )
+from .session import Session
 from .tools import ToolContext, ToolRegistry, ToolResult
+
+
+_SYSTEM_CORE = (
+    "You are an AI coding agent running inside a CLI harness. "
+    "You have access to tools for reading/writing files, running shell commands, "
+    "searching the web, and asking the user questions. "
+    "Use tools when needed; respond directly when you can."
+)
+
+
+def build_system_prompt(cwd: Path) -> str:
+    """组装 system prompt：核心指南 + AGENT.md + MEMORY.md 索引。"""
+    from .memdir.store import load_index as load_memory_index
+
+    parts: list[str] = [_SYSTEM_CORE]
+    agent_md = load_agent_md(cwd)
+    if agent_md:
+        parts.append(agent_md)
+
+    memory_index = load_memory_index(cwd)
+    if memory_index:
+        parts.append(f"<project-memory>\n{memory_index}\n</project-memory>")
+
+    return "\n\n".join(parts)
 
 
 @dataclass
@@ -70,23 +99,45 @@ def run_agent(
     max_steps: int = 8,
     cwd: Path | None = None,
     permission_mode: str = "default",
+    session: Session | None = None,
+    system_prompt: str | None = None,
 ) -> AgentResult:
     resolved_cwd = cwd or Path.cwd()
     ctx = ToolContext(
         cwd=resolved_cwd,
         skip_policy=SkipPolicy.default(gitignore=load_gitignore(resolved_cwd)),
     )
-    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     trace: list[str] = []
     console = Console()
 
     def emit(line: str) -> None:
         trace.append(line)
-        console.print(line)
+        console.print(line, markup=False)
+
+    # Build system prompt
+    system = system_prompt or build_system_prompt(resolved_cwd)
+
+    # Initialize messages from session history or fresh
+    if session and session.history:
+        messages = list(session.history)
+        messages.append({"role": "user", "content": prompt})
+    else:
+        messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+
+    if session:
+        session.append_messages([messages[-1]])
 
     for step in range(max_steps):
-        response = provider.complete(messages, tools=tools.list())
+        # Auto-compact when message count exceeds threshold
+        if len(messages) > 40:
+            messages = _compact_messages(messages, keep=8)
+            console.print(f"[dim]compacted: {len(messages)} messages remaining[/dim]")
+
+        response = provider.complete(messages, tools=tools.list(), system=system)
         messages.append(_assistant_message(response))
+
+        if session:
+            session.append_messages([messages[-1]])
 
         if not response.tool_calls:
             final = response.text or ""
@@ -96,6 +147,42 @@ def run_agent(
         tool_result_blocks: list[dict[str, Any]] = []
         for call in response.tool_calls:
             emit(f"tool_call: {call.name} {call.arguments}")
+
+            # ── Plan mode: enter_plan_mode / exit_plan_mode ──────
+            if call.name == "enter_plan_mode":
+                permission_mode = "plan"
+                result = ToolResult(call.id, "Plan mode on. Write tools denied. Draft a plan, then call exit_plan_mode.", is_error=False)
+                emit(f"observation: {result.content}")
+                tool_result_blocks.append({
+                    "type": "tool_result",
+                    "tool_use_id": result.tool_call_id,
+                    "content": result.content,
+                    "is_error": False,
+                })
+                continue
+
+            if call.name == "exit_plan_mode":
+                plan_summary = call.arguments.get("plan_summary", "")
+                if not confirm_plan(plan_summary):
+                    result = ToolResult(call.id, "Plan not approved. Revise the plan and call exit_plan_mode again.", is_error=True)
+                    emit(f"observation: {result.content}")
+                    tool_result_blocks.append({
+                        "type": "tool_result",
+                        "tool_use_id": result.tool_call_id,
+                        "content": result.content,
+                        "is_error": True,
+                    })
+                    continue
+                permission_mode = "acceptEdits"
+                result = ToolResult(call.id, "Plan approved. Write tools are now enabled.", is_error=False)
+                emit(f"observation: {result.content}")
+                tool_result_blocks.append({
+                    "type": "tool_result",
+                    "tool_use_id": result.tool_call_id,
+                    "content": result.content,
+                    "is_error": False,
+                })
+                continue
 
             # ── Day 5: unified permission gate ──────────────────
             request = PermissionRequest(
@@ -112,6 +199,16 @@ def run_agent(
             edit_preview: tuple[str, str, str] | None = None  # (path_str, old, new)
             if call.name in ("file_write", "file_edit") and decision.behavior != "deny":
                 path_str = call.arguments.get("file_path", "")
+                if not path_str:
+                    result = ToolResult(call.id, "error: missing required argument 'file_path'", is_error=True)
+                    emit(f"observation: {result.content}")
+                    tool_result_blocks.append({
+                        "type": "tool_result",
+                        "tool_use_id": result.tool_call_id,
+                        "content": result.content,
+                        "is_error": True,
+                    })
+                    continue
 
                 # 1) Path resolution — out-of-bounds is an error
                 try:
@@ -252,9 +349,37 @@ def run_agent(
                     })
                     continue
 
+            # ── PreToolUse hooks ─────────────────────────────
+            if decision.behavior != "deny":
+                pre_hooks = run_hooks("PreToolUse", call.name, call.arguments, ctx.cwd)
+                pre_blocked = [h for h in pre_hooks if not h["success"]]
+                if pre_blocked:
+                    blocked_msgs = "\n".join(
+                        f"  [hook] {h['command']}: {h['output']}" for h in pre_blocked
+                    )
+                    observation = f"tool blocked by PreToolUse hook:\n{blocked_msgs}"
+                    emit(f"observation: {observation}")
+                    tool_result_blocks.append({
+                        "type": "tool_result",
+                        "tool_use_id": call.id,
+                        "content": observation,
+                        "is_error": True,
+                    })
+                    continue
+
             # ── 执行工具 ──────────────────────────────────────
             result = tools.run(call, ctx)
             emit(f"observation: {result.content}")
+
+            # ── PostToolUse hooks ────────────────────────────
+            if not result.is_error:
+                post_hooks = run_hooks(
+                    "PostToolUse", call.name, call.arguments, ctx.cwd,
+                    tool_result=result.content,
+                )
+                for h in post_hooks:
+                    status = "ok" if h["success"] else f"warning: {h['output']}"
+                    console.print(f"[dim]hook: PostToolUse {call.name} {status}[/dim]")
             tool_result_blocks.append(
                 {
                     "type": "tool_result",
@@ -264,6 +389,8 @@ def run_agent(
                 }
             )
         messages.append({"role": "user", "content": tool_result_blocks})
+        if session:
+            session.append_messages([messages[-1]])
 
     final = f"reached max_steps={max_steps}"
     emit(f"final: {final}")

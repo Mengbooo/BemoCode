@@ -32,6 +32,7 @@ class ModelProvider(Protocol):
         self,
         messages: list[dict[str, Any]],
         tools: list[Any] | None = None,
+        system: str | None = None,
     ) -> ModelResponse:
         ...
 
@@ -40,7 +41,7 @@ class MockProvider:
     def __init__(self) -> None:
         self._last_tool: str = "echo"
 
-    def complete(self, messages: list[dict[str, str]], tools: list[Any] | None = None) -> ModelResponse:
+    def complete(self, messages: list[dict[str, str]], tools: list[Any] | None = None, system: str | None = None) -> ModelResponse:
         last = messages[-1]
         content = last["content"]
 
@@ -102,6 +103,20 @@ def _mock_args_for(tool_name: str, text: str) -> dict[str, Any]:
         return {"command": "echo hello"}
     if tool_name == "ask_user_question":
         return {"prompt": "What should I do?", "options": ["Option A", "Option B"]}
+    if tool_name == "memory_recall":
+        return {"query": "user preferences"}
+    if tool_name == "memory_write":
+        return {"mem_type": "user", "title": "Test memory", "body": "This is a test memory."}
+    if tool_name == "cron_create":
+        return {"slash": "/help", "every_seconds": 60}
+    if tool_name == "cron_cancel":
+        return {"job_id": "test123"}
+    if tool_name == "todo_write":
+        return {"todos": [{"content": "Test task", "status": "pending"}]}
+    if tool_name == "enter_plan_mode":
+        return {}
+    if tool_name == "exit_plan_mode":
+        return {"plan_summary": "I will implement feature X."}
     return {"text": text}
 
 
@@ -161,12 +176,15 @@ class AnthropicProvider:
         self,
         messages: list[dict[str, Any]],
         tools: list[Any] | None = None,
+        system: str | None = None,
     ) -> ModelResponse:
         kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": self.max_tokens,
             "messages": messages,
         }
+        if system is not None:
+            kwargs["system"] = system
         if tools:
             kwargs["tools"] = _to_anthropic_tools(tools)
 

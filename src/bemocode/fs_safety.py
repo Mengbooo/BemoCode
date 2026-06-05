@@ -1,4 +1,5 @@
 from __future__ import annotations
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -54,13 +55,15 @@ def truncate_output(text: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
 class ReadFileState:
     """path -> (mtime_ns, char_count)。Day 4 read-before-edit 会比对 mtime。"""
     entries: dict[Path, tuple[int, int]] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def record(self, path: Path, content: str) -> None:
         try:
             mtime_ns = path.stat().st_mtime_ns
         except OSError:
             return
-        self.entries[path] = (mtime_ns, len(content))
+        with self._lock:
+            self.entries[path] = (mtime_ns, len(content))
 
 
 @dataclass

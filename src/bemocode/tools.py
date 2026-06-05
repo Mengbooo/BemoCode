@@ -24,6 +24,8 @@ from .fs_safety import (
 )
 from .bash_runner import run_sync as _bash_run_sync
 from .file_history import backup
+from .memdir.store import recall_memory as _memdir_recall, write_memory as _memdir_write
+from .cron_tools import cron_cancel, cron_create, cron_list
 from .model import ToolCall, ToolResult
 
 
@@ -33,9 +35,17 @@ class ToolContext:
     cwd: Path
     skip_policy: SkipPolicy = field(default_factory=SkipPolicy.default)
     read_state: ReadFileState = field(default_factory=ReadFileState)
+    todo_store: list[TodoItem] = field(default_factory=list)
 
 
 ToolFunc = Callable[[dict[str, Any], ToolContext], str]
+
+
+@dataclass
+class TodoItem:
+    content: str
+    status: str = "pending"
+    active_form: str = ""
 
 
 @dataclass
@@ -46,6 +56,7 @@ class Tool:
     parameters: dict[str, Any] = field(
         default_factory=lambda: {"type": "object", "properties": {}, "required": []}
     )
+    is_read_only: bool = False
 
 
 # ── 基础工具 ──────────────────────────────────────────────
@@ -440,6 +451,78 @@ def web_search(args: dict[str, Any], ctx: ToolContext) -> str:
     return truncate_output("\n".join(lines), max_chars=WEB_FETCH_MAX_CHARS)
 
 
+# ── 记忆工具 ──────────────────────────────────────────────
+
+
+def memory_recall(args: dict[str, Any], ctx: ToolContext) -> str:
+    query = args.get("query", "")
+    if not query:
+        return "error: missing required argument 'query'"
+    top_k = min(int(args.get("top_k", 5)), 10)
+    entries = _memdir_recall(ctx.cwd, query, top_k=top_k)
+    if not entries:
+        return "(no memories found)"
+    lines = [f"## {entry.title}\n{entry.body}" for entry in entries]
+    return truncate_output("\n\n".join(lines))
+
+
+def memory_write(args: dict[str, Any], ctx: ToolContext) -> str:
+    mem_type = args.get("mem_type", "")
+    title = args.get("title", "")
+    body = args.get("body", "")
+    if not title:
+        return "error: missing required argument 'title'"
+    if not body:
+        return "error: missing required argument 'body'"
+    if mem_type not in ("user", "feedback", "project", "reference"):
+        return f"error: unknown memory type: {mem_type}"
+    entry = _memdir_write(ctx.cwd, mem_type, title, body)
+    return f"Memory saved: {entry.slug} ({entry.mem_type})"
+
+
+# ── Plan / Todo 工具 ──────────────────────────────────────
+
+
+def todo_write(args: dict[str, Any], ctx: ToolContext) -> str:
+    """全量覆写 todo 列表。由 harness 管理的共享任务板。"""
+    items = [
+        TodoItem(
+            content=t.get("content", ""),
+            status=t.get("status", "pending"),
+            active_form=t.get("activeForm", ""),
+        )
+        for t in args.get("todos", [])
+    ]
+    ctx.todo_store = items
+
+    icon = {"pending": "○", "in_progress": "◉", "completed": "✓"}
+    lines = ["## Todos"]
+    for t in items:
+        lines.append(f"  {icon.get(t.status, '?')} {t.content}")
+    lines.append("")
+    lines.append("Todos updated.")
+
+    completed = sum(1 for t in items if t.status == "completed")
+    kws = ("test", "pytest", "verify", "lint", "check")
+    has_verify = any(any(k in t.content.lower() for k in kws) for t in items)
+    if completed >= 3 and not has_verify:
+        lines.append("提示：关掉了 3+ 个任务但没有验证步骤，建议先加一个测试/验证项再收尾。")
+
+    return "\n".join(lines)
+
+
+def enter_plan_mode(args: dict[str, Any], ctx: ToolContext) -> str:
+    return (
+        "Plan mode on. Write tools are denied. Draft a clear plan, then present it "
+        "(or call exit_plan_mode(plan_summary)). The harness will ask the user to "
+        "approve before writes unlock."
+    )
+
+
+def exit_plan_mode(args: dict[str, Any], ctx: ToolContext) -> str:
+    return "Plan approved. Write tools are now enabled."
+
+
 # ── ToolRegistry ──────────────────────────────────────────
 
 class ToolRegistry:
@@ -701,6 +784,135 @@ def default_tools() -> ToolRegistry:
                     },
                 },
                 "required": ["prompt", "options"],
+            },
+        )
+    )
+    registry.register(
+        Tool(
+            name="memory_recall",
+            description="Search the agent's long-term memory for relevant facts.",
+            run=memory_recall,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query for memory recall"},
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Max results (1-10), default 5",
+                    },
+                },
+                "required": ["query"],
+            },
+        )
+    )
+    registry.register(
+        Tool(
+            name="memory_write",
+            description="Save a fact to the agent's long-term memory.",
+            run=memory_write,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "mem_type": {
+                        "type": "string",
+                        "description": "Memory type: user, feedback, project, reference",
+                    },
+                    "title": {"type": "string", "description": "Short title for the memory"},
+                    "body": {"type": "string", "description": "The memory content"},
+                },
+                "required": ["title", "body"],
+            },
+        )
+    )
+    registry.register(
+        Tool(
+            name="cron_create",
+            description="Schedule a recurring slash command or prompt.",
+            run=cron_create,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "slash": {"type": "string", "description": "Slash command or prompt to run"},
+                    "every_seconds": {
+                        "type": "integer",
+                        "description": "Interval in seconds",
+                    },
+                    "label": {"type": "string", "description": "Optional label"},
+                },
+                "required": ["slash", "every_seconds"],
+            },
+        )
+    )
+    registry.register(
+        Tool(
+            name="cron_list",
+            description="List all scheduled cron jobs.",
+            run=cron_list,
+        )
+    )
+    registry.register(
+        Tool(
+            name="cron_cancel",
+            description="Cancel a scheduled cron job by ID.",
+            run=cron_cancel,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "Cron job ID to cancel"},
+                },
+                "required": ["job_id"],
+            },
+        )
+    )
+    registry.register(
+        Tool(
+            name="todo_write",
+            description="Create and manage a structured task list for your coding session.",
+            run=todo_write,
+            is_read_only=False,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string"},
+                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                                "activeForm": {"type": "string"},
+                            },
+                        },
+                        "description": "List of todo items",
+                    },
+                },
+                "required": ["todos"],
+            },
+        )
+    )
+    registry.register(
+        Tool(
+            name="enter_plan_mode",
+            description="Enter plan mode: write tools are denied, only read tools allowed.",
+            run=enter_plan_mode,
+            is_read_only=False,
+        )
+    )
+    registry.register(
+        Tool(
+            name="exit_plan_mode",
+            description="Exit plan mode with a plan summary for user approval.",
+            run=exit_plan_mode,
+            is_read_only=False,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "plan_summary": {
+                        "type": "string",
+                        "description": "Summary of the plan for user approval",
+                    },
+                },
+                "required": ["plan_summary"],
             },
         )
     )

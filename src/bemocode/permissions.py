@@ -9,12 +9,24 @@ from typing import Any
 _READONLY_TOOLS = frozenset({
     "read_file", "list_files", "glob", "grep", "project_tree",
     "git_status", "git_diff", "system_date", "echo",
+    "memory_recall",
+    "cron_list",
 })
 
 # Tools that should always ask — user should know agent is pausing to
 # ask a question or accessing external resources
 _ASK_TOOLS = frozenset({
     "ask_user_question", "web_fetch", "web_search",
+})
+
+# Low-risk writes: auto-allowed in default/acceptEdits, denied in plan mode
+_LOW_RISK_WRITES = frozenset({
+    "memory_write",
+    "cron_create",
+    "cron_cancel",
+    "enter_plan_mode",
+    "exit_plan_mode",
+    "todo_write",
 })
 
 # Dangerous command patterns — matched against the full command string
@@ -74,6 +86,10 @@ def decide_permission(request: PermissionRequest) -> PermissionDecision:
 
     # Read-only tools are allowed in all modes by default
     if tool_name in _READONLY_TOOLS:
+        return PermissionDecision("allow")
+
+    # Low-risk writes are auto-allowed in default/acceptEdits modes
+    if tool_name in _LOW_RISK_WRITES:
         return PermissionDecision("allow")
 
     # bash tool: dangerous command detection — blocks before any UI

@@ -67,6 +67,20 @@ def prompt_single_choice(question: str, labels: list[str]) -> str | None:
         return None
 
 
+def confirm_plan(plan_summary: str) -> bool:
+    """显示计划摘要，请求用户审批。"""
+    from io import StringIO
+
+    from rich.panel import Panel
+
+    buffer = StringIO()
+    c = Console(file=buffer, no_color=True)
+    c.print(Panel(plan_summary or "(empty plan)", title="Plan", border_style="blue"))
+    panel = buffer.getvalue()
+    typer.echo(panel, nl=False)
+    return typer.confirm("Approve this plan and exit plan mode?", default=False)
+
+
 def _tool_summary(tool_name: str, args: dict) -> str:
     """Generate a short human-readable summary of a tool call."""
     if tool_name == "web_fetch":
