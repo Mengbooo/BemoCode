@@ -92,6 +92,58 @@ def _tool_result_message(tool_call_id: str, content: str, is_error: bool = False
     }
 
 
+def _emit_styled(console: Console, line: str) -> None:
+    """美化 agent trace 输出：不同类型的消息用不同颜色/样式。"""
+    from rich.text import Text
+
+    if line.startswith("tool_call:"):
+        # tool_call: <name> <args>
+        rest = line[len("tool_call:"):].strip()
+        parts = rest.split(" ", 1)
+        tool_name = parts[0] if parts else rest
+        args_str = parts[1] if len(parts) > 1 else ""
+
+        out = Text()
+        out.append("  ⚙ ", style="dim")
+        out.append(tool_name, style="bold bright_cyan")
+        if args_str:
+            out.append(" ", style="")
+            # 截断过长参数
+            display_args = args_str if len(args_str) <= 120 else args_str[:120] + "..."
+            out.append(display_args, style="dim")
+        console.print(out)
+
+    elif line.startswith("observation:"):
+        rest = line[len("observation:"):].strip()
+        out = Text()
+        out.append("  ← ", style="dim green")
+        # 截断过长 observation
+        if len(rest) > 300:
+            rest = rest[:300] + "..."
+        out.append(rest, style="italic dim")
+        console.print(out)
+
+    elif line.startswith("final:"):
+        rest = line[len("final:"):].strip()
+        out = Text()
+        out.append("  ◆ ", style="bold bright_green")
+        out.append(rest, style="white")
+        console.print(out)
+
+    elif line.startswith("interrupted"):
+        console.print(f"  ⏎ {line}", style="yellow")
+
+    elif line.startswith("continue:"):
+        rest = line[len("continue:"):].strip()
+        console.print(f"  ↻ {rest}", style="dim cyan")
+
+    elif line.startswith("compacted"):
+        console.print(f"  ⊟ {line}", style="dim")
+
+    else:
+        console.print(f"    {line}", markup=False)
+
+
 def run_agent(
     prompt: str,
     provider: ModelProvider,
@@ -112,7 +164,7 @@ def run_agent(
 
     def emit(line: str) -> None:
         trace.append(line)
-        console.print(line, markup=False)
+        _emit_styled(console, line)
 
     # Build system prompt
     system = system_prompt or build_system_prompt(resolved_cwd)

@@ -5,6 +5,7 @@ from pathlib import Path
 import typer
 from dotenv import load_dotenv
 from rich.console import Console
+from rich.prompt import Prompt
 
 from .agent import build_system_prompt, run_agent
 from .model import create_provider
@@ -95,7 +96,7 @@ def main_command(
     show_banner(resolved_cwd, provider, model, base_url, session,
                 permission_mode, tool_count=len(tools.list_tools()))
     while True:
-        line = typer.prompt(">").strip()
+        line = Prompt.ask("  [bold bright_cyan]▸[/bold bright_cyan]").strip()
         if not line:
             continue
         if line == "/exit":
