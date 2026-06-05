@@ -47,9 +47,7 @@ def run_once(
     render_header(cwd, provider, model, base_url)
     os.chdir(cwd)
     prov = create_provider(provider, model, base_url)
-    result = run_agent(prompt, prov, tools, max_steps=max_steps, cwd=cwd)
-    for line in result.trace:
-        console.print(line)
+    run_agent(prompt, prov, tools, max_steps=max_steps, cwd=cwd)
 
 
 @app.callback(invoke_without_command=True)

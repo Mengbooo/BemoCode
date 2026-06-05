@@ -82,6 +82,7 @@ def _mock_args_for(tool_name: str, text: str) -> dict[str, Any]:
     path_tools = {"read_file", "list_files"}
     search_tools = {"grep"}
     web_tools = {"web_fetch", "web_search"}
+    edit_tools = {"file_write", "file_edit"}
     if tool_name in path_tools:
         return {"path": "."}
     if tool_name == "glob":
@@ -94,6 +95,8 @@ def _mock_args_for(tool_name: str, text: str) -> dict[str, Any]:
         return {"url": "https://example.com"}
     if tool_name == "web_search":
         return {"query": "hello"}
+    if tool_name in edit_tools:
+        return {"file_path": "test.txt", "content": "hello", "old_string": "hello", "new_string": "world"}
     return {"text": text}
 
 
