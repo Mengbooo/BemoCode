@@ -55,17 +55,19 @@ class MockProvider:
             # content 可能是字符串或列表
             text = content if isinstance(content, str) else str(content)
             self._last_tool = "echo"
-            if "用 " in text and " 工具说" in text:
+            if "用 " in text and " 工具" in text:
                 _, _, rest = text.partition("用 ")
-                tool_name, _, text = rest.partition(" 工具说")
+                tool_name, _, rest2 = rest.partition(" 工具")
                 self._last_tool = tool_name.strip()
-                text = text.strip() or text
+
+            # 根据不同工具构造合适的参数
+            args = _mock_args_for(self._last_tool, text)
             return ModelResponse(
                 tool_calls=[
                     ToolCall(
                         id=f"call_{self._last_tool}_1",
                         name=self._last_tool,
-                        arguments={"text": text},
+                        arguments=args,
                     )
                 ],
                 stop_reason="tool_use",
@@ -73,6 +75,26 @@ class MockProvider:
         if last["role"] == "tool":
             return ModelResponse(text=f"{self._last_tool} 工具返回：{last['content']}")
         return ModelResponse(text="我现在只能演示 echo 和 uppercase 工具。")
+
+
+def _mock_args_for(tool_name: str, text: str) -> dict[str, Any]:
+    """根据工具名生成默认参数，让 MockProvider 勉强可用。"""
+    path_tools = {"read_file", "list_files"}
+    search_tools = {"grep"}
+    web_tools = {"web_fetch", "web_search"}
+    if tool_name in path_tools:
+        return {"path": "."}
+    if tool_name == "glob":
+        return {"pattern": "*.py"}
+    if tool_name in search_tools:
+        return {"pattern": ".", "path": "."}
+    if tool_name == "project_tree":
+        return {"max_depth": 2}
+    if tool_name == "web_fetch":
+        return {"url": "https://example.com"}
+    if tool_name == "web_search":
+        return {"query": "hello"}
+    return {"text": text}
 
 
 def _to_anthropic_tools(tools: list[Any]) -> list[dict[str, Any]]:

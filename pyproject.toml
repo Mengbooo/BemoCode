@@ -9,7 +9,9 @@ authors = [
 requires-python = ">=3.10"
 dependencies = [
     "anthropic>=0.105.2",
+    "html2text>=2025.4.15",
     "httpx[socks]>=0.28.1",
+    "pathspec>=1.1.1",
     "python-dotenv>=1.2.2",
     "rich>=13.7.0",
     "typer>=0.12.0",

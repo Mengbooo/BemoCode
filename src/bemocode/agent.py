@@ -1,8 +1,11 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+from .fs_safety import SkipPolicy, load_gitignore
 from .model import ModelProvider, ModelResponse
-from .tools import ToolRegistry
+from .tools import ToolContext, ToolRegistry
 
 
 @dataclass
@@ -48,7 +51,13 @@ def run_agent(
     provider: ModelProvider,
     tools: ToolRegistry,
     max_steps: int = 8,
+    cwd: Path | None = None,
 ) -> AgentResult:
+    resolved_cwd = cwd or Path.cwd()
+    ctx = ToolContext(
+        cwd=resolved_cwd,
+        skip_policy=SkipPolicy.default(gitignore=load_gitignore(resolved_cwd)),
+    )
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     trace: list[str] = []
 
@@ -61,13 +70,20 @@ def run_agent(
             trace.append(f"final: {final}")
             return AgentResult(final=final, trace=trace, messages=messages)
 
+        tool_result_blocks: list[dict[str, Any]] = []
         for call in response.tool_calls:
             trace.append(f"tool_call: {call.name} {call.arguments}")
-            result = tools.run(call)
+            result = tools.run(call, ctx)
             trace.append(f"observation: {result.content}")
-            messages.append(
-                _tool_result_message(result.tool_call_id, result.content, result.is_error)
+            tool_result_blocks.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": result.tool_call_id,
+                    "content": result.content,
+                    "is_error": result.is_error,
+                }
             )
+        messages.append({"role": "user", "content": tool_result_blocks})
 
     final = f"reached max_steps={max_steps}"
     trace.append(f"final: {final}")
