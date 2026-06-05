@@ -108,8 +108,7 @@ def main_command(
     while True:
         console.print()
         _user_sep(console)
-        console.print("  ", end="")
-        line = input().strip()
+        line = input("  ").strip()
         if not line:
             continue
         if line == "/exit":
