@@ -93,59 +93,70 @@ def _tool_result_message(tool_call_id: str, content: str, is_error: bool = False
 
 
 def _emit_styled(console: Console, line: str) -> None:
-    """美化 agent trace 输出：不同类型的消息用不同颜色/样式。"""
+    """美化 agent trace 输出：用彩色分割线区分不同消息类型。"""
     from rich.markdown import Markdown
-    from rich.panel import Panel
     from rich.text import Text
 
     if line.startswith("tool_call:"):
-        # tool_call: <name> <args>
         rest = line[len("tool_call:"):].strip()
         parts = rest.split(" ", 1)
         tool_name = parts[0] if parts else rest
         args_str = parts[1] if len(parts) > 1 else ""
 
-        console.print()  # 空行隔开
-        out = Text()
-        out.append("  ⚙ ", style="dim")
-        out.append(tool_name, style="bold bright_cyan")
+        console.print()
+        # 分割线：工具名
+        _sep(console, f"Agent · {tool_name}", style="yellow")
         if args_str:
-            out.append(" ", style="")
-            display_args = args_str if len(args_str) <= 120 else args_str[:120] + "..."
-            out.append(display_args, style="dim")
-        console.print(out)
+            display_args = args_str if len(args_str) <= 200 else args_str[:200] + "..."
+            console.print(f"  {display_args}", style="dim")
 
     elif line.startswith("observation:"):
         rest = line[len("observation:"):].strip()
-        out = Text()
-        out.append("  ← ", style="dim green")
-        if len(rest) > 300:
-            rest = rest[:300] + "..."
-        out.append(rest, style="italic dim")
-        console.print(out)
+        _sep(console, "result", style="dim green")
+        if len(rest) > 400:
+            rest = rest[:400] + "..."
+        console.print(f"  {rest}", style="italic dim")
 
     elif line.startswith("final:"):
         rest = line[len("final:"):].strip()
         if not rest:
             return
         console.print()
-        console.print("  ◆", style="bold bright_green", end=" ")
+        _sep(console, "Agent", style="bright_green")
+        console.print()
         md = Markdown(rest, code_theme="monokai")
         console.print(md)
         console.print()
 
     elif line.startswith("interrupted"):
-        console.print(f"\n  ⏎ {line}\n", style="yellow")
+        _sep(console, "interrupted", style="yellow")
+        console.print(f"  {line}", style="yellow")
 
     elif line.startswith("continue:"):
         rest = line[len("continue:"):].strip()
-        console.print(f"\n  ↻ {rest}", style="dim cyan")
+        _sep(console, "continue", style="dim cyan")
+        console.print(f"  {rest}", style="dim cyan")
 
     elif line.startswith("compacted"):
         console.print(f"  ⊟ {line}", style="dim")
 
     else:
         console.print(f"    {line}", markup=False)
+
+
+def _sep(console: Console, label: str, style: str = "dim") -> None:
+    """画一条带标签的分割线。"""
+    width = console.width or 78
+    label_text = f"  {label}  "
+    # 用 rich Text 保证颜色正确
+    from rich.text import Text
+    line = Text()
+    line.append("─" * 4, style=style)
+    line.append(label_text, style=f"bold {style}")
+    remaining = width - 4 - len(label_text)
+    if remaining > 0:
+        line.append("─" * remaining, style=style)
+    console.print(line)
 
 
 def run_agent(

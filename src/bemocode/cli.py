@@ -21,6 +21,17 @@ app = typer.Typer(add_completion=False)
 tools = default_tools()
 
 
+def _user_sep(console: Console) -> None:
+    """用户输入前的分割线。"""
+    from rich.text import Text
+    width = console.width or 78
+    line = Text()
+    line.append("───", style="bold bright_cyan")
+    line.append(" You ", style="bold white on bright_cyan")
+    line.append("─" * max(0, width - 8), style="bright_cyan")
+    console.print(line)
+
+
 def handle_slash(line: str) -> bool:
     if line == "/help":
         console.print("可用命令：[bold]/help[/bold], [bold]/exit[/bold]")
@@ -96,6 +107,8 @@ def main_command(
     show_banner(resolved_cwd, provider, model, base_url, session,
                 permission_mode, tool_count=len(tools.list_tools()))
     while True:
+        console.print()
+        _user_sep(console)
         line = Prompt.ask("  [bold bright_cyan]▸[/bold bright_cyan]").strip()
         if not line:
             continue
