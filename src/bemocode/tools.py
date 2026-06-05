@@ -532,6 +532,9 @@ class ToolRegistry:
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
 
+    def get(self, name: str) -> Tool | None:
+        return self._tools.get(name)
+
     def list(self) -> list[Tool]:
         return list(self._tools.values())
 
@@ -916,4 +919,16 @@ def default_tools() -> ToolRegistry:
             },
         )
     )
+    # Mark read-only tools for parallel execution
+    _read_only_names = {
+        "echo", "system_date", "uppercase",
+        "read_file", "list_files", "glob", "grep", "project_tree",
+        "git_status", "git_diff", "web_search",
+        "memory_recall", "cron_list",
+    }
+    for name in _read_only_names:
+        tool = registry.get(name)
+        if tool:
+            tool.is_read_only = True
+
     return registry

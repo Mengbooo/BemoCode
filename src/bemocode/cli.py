@@ -7,7 +7,9 @@ from dotenv import load_dotenv
 from rich.console import Console
 
 from .agent import build_system_prompt, run_agent
+from .interactive import start_interactive_shell
 from .model import create_provider
+from .runtime import RuntimeState
 from .session import Session
 from .slash import SlashContext, dispatch_slash
 from .startup import show_banner
@@ -18,27 +20,6 @@ load_dotenv()
 console = Console()
 app = typer.Typer(add_completion=False)
 tools = default_tools()
-
-
-def _user_sep(console: Console) -> None:
-    """用户输入前的分割线。"""
-    from rich.text import Text
-    width = console.width or 78
-    line = Text()
-    line.append("───", style="bold")
-    line.append(" You ", style="reverse bold")
-    line.append("─" * max(0, width - 8), style="dim")
-    console.print(line)
-
-
-def handle_slash(line: str) -> bool:
-    if line == "/help":
-        console.print("可用命令：[bold]/help[/bold], [bold]/exit[/bold]")
-        console.print("\n[bold]注册的工具:[/bold]")
-        for tool in tools.list_tools():
-            console.print(f"  [cyan]{tool.name}[/cyan] — {tool.description}")
-        return True
-    return False
 
 
 def run_once(
@@ -96,46 +77,42 @@ def main_command(
 
     system_prompt = build_system_prompt(resolved_cwd)
 
+    # Runtime state shared between CLI and agent
+    state = RuntimeState(
+        permission_mode=permission_mode,
+        model=model,
+        provider=provider,
+    )
+
     if text:
+        # One-shot mode
         show_banner(resolved_cwd, provider, model, base_url, session,
                     permission_mode, tool_count=len(tools.list_tools()))
         run_once(text, resolved_cwd, provider, model, base_url, max_steps,
                  permission_mode, session=session, system_prompt=system_prompt)
         return
 
-    show_banner(resolved_cwd, provider, model, base_url, session,
-                permission_mode, tool_count=len(tools.list_tools()))
-    while True:
-        console.print()
-        _user_sep(console)
-        line = input("  ").strip()
-        if not line:
-            continue
-        if line == "/exit":
-            console.print("Bye.")
-            return
-        if line.startswith("/"):
-            result = dispatch_slash(line, SlashContext(
-                cwd=resolved_cwd,
-                permission_mode=permission_mode,
-                model=model,
-                provider=provider,
-                session_id=session.session_id if session else None,
-            ))
-            if result.handled:
-                if result.message:
-                    console.print(result.message)
-                if result.should_query:
-                    if session is None:
-                        session = Session.create(resolved_cwd)
-                    run_once(result.prompt, resolved_cwd, provider, model, base_url,
-                             max_steps, permission_mode, session=session,
-                             system_prompt=system_prompt)
-                continue
+    # REPL mode with TUI
+    def handle_input(user_input: str) -> None:
+        nonlocal session
         if session is None:
             session = Session.create(resolved_cwd)
-        run_once(line, resolved_cwd, provider, model, base_url, max_steps,
-                 permission_mode, session=session, system_prompt=system_prompt)
+        run_once(user_input, resolved_cwd, provider, state.model, base_url, max_steps,
+                 state.permission_mode, session=session, system_prompt=system_prompt)
+
+    start_interactive_shell(
+        cwd=resolved_cwd,
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        max_steps=max_steps,
+        permission_mode=permission_mode,
+        session=session,
+        system_prompt=system_prompt,
+        on_input=handle_input,
+        tools=tools,
+        state=state,
+    )
 
 
 def main() -> None:

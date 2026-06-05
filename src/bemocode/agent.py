@@ -1,9 +1,13 @@
 from __future__ import annotations
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.text import Text
 
 from .compact_basic import compact as _compact_messages
 from .hooks import run_hooks
@@ -15,7 +19,7 @@ from .fs_safety import (
     load_gitignore,
     resolve_in_cwd,
 )
-from .model import ModelProvider, ModelResponse
+from .model import ModelProvider, ModelResponse, StreamEvent, ToolCall, ToolResult
 from .permissions import PermissionRequest, decide_permission
 from .project_memory import load_agent_md
 from .prompt_ui import (
@@ -27,7 +31,7 @@ from .prompt_ui import (
     render_diff,
 )
 from .session import Session
-from .tools import ToolContext, ToolRegistry, ToolResult
+from .tools import ToolContext, ToolRegistry
 
 
 _SYSTEM_CORE = (
@@ -157,6 +161,205 @@ def _sep(console: Console, label: str, style: str = "dim") -> None:
     console.print(line)
 
 
+def _partition_tool_calls(calls: list[ToolCall], tools: ToolRegistry) -> list[list[ToolCall]]:
+    """把连续只读工具合并为并行 batch，写工具各自独立串行。"""
+    batches: list[list[ToolCall]] = []
+    current: list[ToolCall] = []
+    for call in calls:
+        tool = tools.get(call.name)
+        is_ro = tool is not None and tool.is_read_only
+        if is_ro:
+            current.append(call)
+        else:
+            if current:
+                batches.append(current)
+                current = []
+            batches.append([call])
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _display_streaming_text(
+    provider: ModelProvider,
+    messages: list[dict[str, Any]],
+    tools: ToolRegistry,
+    system: str,
+    console: Console,
+    text: str,
+) -> None:
+    """如果 provider 支持流式，逐词显示文本（视觉动效）；否则直接打印。"""
+    if not text:
+        return
+    try:
+        events = provider.complete_stream(messages, tools=tools.list(), system=system)
+    except Exception:
+        # 不支持流式，直接渲染 markdown
+        console.print(Markdown(text, code_theme="monokai"))
+        return
+
+    words = text.split()
+    if not words:
+        console.print(Markdown(text, code_theme="monokai"))
+        return
+
+    # 用 Live 逐词显示
+    displayed: list[str] = []
+    md = Markdown("", code_theme="monokai")
+    with Live(md, console=console, refresh_per_second=15, transient=False) as live:
+        for word in words:
+            displayed.append(word)
+            md = Markdown(" ".join(displayed), code_theme="monokai")
+            live.update(md)
+        # 最终完整显示
+        md = Markdown(text, code_theme="monokai")
+        live.update(md)
+
+
+def _execute_one_tool(
+    call: ToolCall,
+    ctx: ToolContext,
+    permission_mode: str,
+    tools: ToolRegistry,
+    console: Console,
+    emit,
+) -> tuple[ToolResult, dict[str, Any] | None, str]:
+    """执行单个工具调用，含权限检查和安全验证。
+    返回 (result, tool_result_block, new_permission_mode)。
+    """
+
+    # ── Plan mode: enter_plan_mode / exit_plan_mode ──────────
+    if call.name == "enter_plan_mode":
+        result = ToolResult(call.id, "Plan mode on. Write tools denied.", is_error=False)
+        return result, _trb(result), "plan"
+
+    if call.name == "exit_plan_mode":
+        plan_summary = call.arguments.get("plan_summary", "")
+        if not confirm_plan(plan_summary):
+            result = ToolResult(call.id, "Plan not approved. Revise.", is_error=True)
+            return result, _trb(result), permission_mode
+        result = ToolResult(call.id, "Plan approved. Write tools enabled.", is_error=False)
+        return result, _trb(result), "acceptEdits"
+
+    # ── Permission gate ──────────────────────────────────────
+    request = PermissionRequest(
+        tool_name=call.name,
+        args=call.arguments,
+        mode=permission_mode,
+        cwd=ctx.cwd,
+    )
+    decision = decide_permission(request)
+
+    # ── Edit preview ─────────────────────────────────────────
+    edit_preview: tuple | None = None
+    if call.name in ("file_write", "file_edit") and decision.behavior != "deny":
+        path_str = call.arguments.get("file_path", "")
+        if not path_str:
+            return ToolResult(call.id, "error: missing 'file_path'", is_error=True), _trb(ToolResult(call.id, "error: missing 'file_path'", is_error=True)), permission_mode
+
+        try:
+            path = resolve_in_cwd(ctx.cwd, path_str)
+        except (ValueError, OSError) as exc:
+            return ToolResult(call.id, f"error: {exc}", is_error=True), _trb(ToolResult(call.id, f"error: {exc}", is_error=True)), permission_mode
+
+        old_content = path.read_text(encoding="utf-8") if path.exists() else ""
+
+        validation_error: str | None = None
+        if call.name == "file_write":
+            if path.exists():
+                validation_error = ensure_read_before_edit(ctx.read_state, path) or check_mtime_conflict(ctx.read_state, path)
+        else:
+            if not path.exists():
+                validation_error = f"error: file does not exist: {path_str}"
+            else:
+                validation_error = ensure_read_before_edit(ctx.read_state, path) or check_mtime_conflict(ctx.read_state, path)
+
+        new_content: str | None = None
+        if call.name == "file_write":
+            new_content = call.arguments.get("content", "")
+        elif call.name == "file_edit" and validation_error is None:
+            new_content, replace_err = apply_single_replace(
+                old_content,
+                call.arguments.get("old_string", ""),
+                call.arguments.get("new_string", ""),
+                bool(call.arguments.get("replace_all", False)),
+            )
+            if replace_err:
+                validation_error = replace_err
+
+        if validation_error:
+            return ToolResult(call.id, validation_error, is_error=True), _trb(ToolResult(call.id, validation_error, is_error=True)), permission_mode
+
+        edit_preview = (path_str, old_content, new_content or "")
+
+    # ── Decision branches ────────────────────────────────────
+    if decision.behavior == "deny":
+        return ToolResult(call.id, f"error: {decision.message}", is_error=True), _trb(ToolResult(call.id, f"error: {decision.message}", is_error=True)), permission_mode
+
+    if decision.behavior == "ask":
+        if call.name in ("file_write", "file_edit") and edit_preview is not None:
+            path_str, old_content, new_content = edit_preview
+            diff_text = render_diff(old_content, new_content, path_str)
+            console.print(f"\n[bold]Diff for {path_str}:[/bold]")
+            console.print(diff_text)
+            if not confirm_edit(path_str):
+                return ToolResult(call.id, "error: edit rejected by user", is_error=True), _trb(ToolResult(call.id, "error: edit rejected by user", is_error=True)), permission_mode
+
+        elif call.name == "bash":
+            command = call.arguments.get("command", "")
+            timeout = call.arguments.get("timeout", 30)
+            console.print(f"\n[bold]Command:[/bold] {command}")
+            console.print(f"[dim]timeout: {timeout}s  cwd: {ctx.cwd}[/dim]")
+            if not confirm_command(command):
+                return ToolResult(call.id, "error: command rejected by user", is_error=True), _trb(ToolResult(call.id, "error: command rejected by user", is_error=True)), permission_mode
+
+        elif call.name in ("web_fetch", "web_search"):
+            if not confirm_tool_use(call.name, call.arguments):
+                return ToolResult(call.id, "error: tool use rejected by user", is_error=True), _trb(ToolResult(call.id, "error: tool use rejected by user", is_error=True)), permission_mode
+
+        elif call.name == "ask_user_question":
+            question = call.arguments.get("prompt", "")
+            options = call.arguments.get("options", [])
+            if not isinstance(options, list):
+                options = []
+            labels = [str(o) for o in options]
+            selected = prompt_single_choice(question, labels)
+            result = ToolResult(call.id, f'User selected: "{selected}"' if selected else "User skipped.", is_error=False)
+            return result, _trb(result), permission_mode
+
+    # ── PreToolUse hooks ─────────────────────────────────────
+    if decision.behavior != "deny":
+        pre_hooks = run_hooks("PreToolUse", call.name, call.arguments, ctx.cwd)
+        pre_blocked = [h for h in pre_hooks if not h["success"]]
+        if pre_blocked:
+            blocked_msgs = "\n".join(f"  [hook] {h['command']}: {h['output']}" for h in pre_blocked)
+            result = ToolResult(call.id, f"tool blocked by PreToolUse hook:\n{blocked_msgs}", is_error=True)
+            return result, _trb(result), permission_mode
+
+    # ── Execute ──────────────────────────────────────────────
+    result = tools.run(call, ctx)
+    emit(f"observation: {result.content}")
+
+    # ── PostToolUse hooks ────────────────────────────────────
+    if not result.is_error:
+        post_hooks = run_hooks("PostToolUse", call.name, call.arguments, ctx.cwd, tool_result=result.content)
+        for h in post_hooks:
+            status = "ok" if h["success"] else f"warning: {h['output']}"
+            console.print(f"[dim]hook: PostToolUse {call.name} {status}[/dim]")
+
+    return result, _trb(result), permission_mode
+
+
+def _trb(result: ToolResult) -> dict[str, Any]:
+    """构造 tool_result block 字典。"""
+    return {
+        "type": "tool_result",
+        "tool_use_id": result.tool_call_id,
+        "content": result.content,
+        "is_error": result.is_error,
+    }
+
+
 def run_agent(
     prompt: str,
     provider: ModelProvider,
@@ -179,10 +382,8 @@ def run_agent(
         trace.append(line)
         _emit_styled(console, line)
 
-    # Build system prompt
     system = system_prompt or build_system_prompt(resolved_cwd)
 
-    # Initialize messages from session history or fresh
     if session and session.history:
         messages = list(session.history)
         messages.append({"role": "user", "content": prompt})
@@ -193,266 +394,66 @@ def run_agent(
         session.append_messages([messages[-1]])
 
     for step in range(max_steps):
-        # Auto-compact when message count exceeds threshold
         if len(messages) > 40:
             messages = _compact_messages(messages, keep=8)
             console.print(f"[dim]compacted: {len(messages)} messages remaining[/dim]")
 
+        # ── Model call ────────────────────────────────────────
         response = provider.complete(messages, tools=tools.list(), system=system)
         messages.append(_assistant_message(response))
-
         if session:
             session.append_messages([messages[-1]])
 
+        # ── Streaming text display ─────────────────────────────
+        if response.text and not response.tool_calls:
+            console.print()
+            _sep(console, "Agent", style="bold")
+            console.print()
+            _display_streaming_text(provider, messages, tools, system, console, response.text)
+            console.print()
+            return AgentResult(final=response.text, trace=trace, messages=messages)
+
         if not response.tool_calls:
             final = response.text or ""
-            emit(f"final: {final}")
             return AgentResult(final=final, trace=trace, messages=messages)
 
+        # ── Agent thinking text before tool calls ──────────────
+        if response.text:
+            console.print()
+            _sep(console, "Agent", style="bold")
+            console.print()
+            if response.text:
+                _display_streaming_text(provider, messages, tools, system, console, response.text)
+
+        # ── Parallel/serial execution ─────────────────────────
+        batches = _partition_tool_calls(response.tool_calls or [], tools)
         tool_result_blocks: list[dict[str, Any]] = []
-        for call in response.tool_calls:
-            emit(f"tool_call: {call.name} {call.arguments}")
 
-            # ── Plan mode: enter_plan_mode / exit_plan_mode ──────
-            if call.name == "enter_plan_mode":
-                permission_mode = "plan"
-                result = ToolResult(call.id, "Plan mode on. Write tools denied. Draft a plan, then call exit_plan_mode.", is_error=False)
-                emit(f"observation: {result.content}")
-                tool_result_blocks.append({
-                    "type": "tool_result",
-                    "tool_use_id": result.tool_call_id,
-                    "content": result.content,
-                    "is_error": False,
-                })
-                continue
+        for batch in batches:
+            if len(batch) == 1:
+                # Serial execution
+                call = batch[0]
+                emit(f"tool_call: {call.name} {call.arguments}")
+                result, block, new_mode = _execute_one_tool(call, ctx, permission_mode, tools, console, emit)
+                permission_mode = new_mode
+                tool_result_blocks.append(block)
+            else:
+                # Parallel execution for read-only batch
+                tool_names = ", ".join(c.name for c in batch)
+                emit(f"tool_call: [{tool_names}] (parallel)")
 
-            if call.name == "exit_plan_mode":
-                plan_summary = call.arguments.get("plan_summary", "")
-                if not confirm_plan(plan_summary):
-                    result = ToolResult(call.id, "Plan not approved. Revise the plan and call exit_plan_mode again.", is_error=True)
-                    emit(f"observation: {result.content}")
-                    tool_result_blocks.append({
-                        "type": "tool_result",
-                        "tool_use_id": result.tool_call_id,
-                        "content": result.content,
-                        "is_error": True,
-                    })
-                    continue
-                permission_mode = "acceptEdits"
-                result = ToolResult(call.id, "Plan approved. Write tools are now enabled.", is_error=False)
-                emit(f"observation: {result.content}")
-                tool_result_blocks.append({
-                    "type": "tool_result",
-                    "tool_use_id": result.tool_call_id,
-                    "content": result.content,
-                    "is_error": False,
-                })
-                continue
+                with ThreadPoolExecutor(max_workers=min(len(batch), 8)) as ex:
+                    futures = {
+                        ex.submit(_execute_one_tool, call, ctx, permission_mode, tools, console, emit): call
+                        for call in batch
+                    }
+                    for future in futures:
+                        call = futures[future]
+                        result, block, new_mode = future.result()
+                        if new_mode != permission_mode:
+                            permission_mode = new_mode
+                        tool_result_blocks.append(block)
 
-            # ── Day 5: unified permission gate ──────────────────
-            request = PermissionRequest(
-                tool_name=call.name,
-                args=call.arguments,
-                mode=permission_mode,
-                cwd=ctx.cwd,
-            )
-            decision = decide_permission(request)
-
-            # Edit preview: for file_write/file_edit, run Day 4 safety
-            # checks regardless of mode (acceptEdits skips CONFIRMATION,
-            # not validation). Compute old/new content + validation errors.
-            edit_preview: tuple[str, str, str] | None = None  # (path_str, old, new)
-            if call.name in ("file_write", "file_edit") and decision.behavior != "deny":
-                path_str = call.arguments.get("file_path", "")
-                if not path_str:
-                    result = ToolResult(call.id, "error: missing required argument 'file_path'", is_error=True)
-                    emit(f"observation: {result.content}")
-                    tool_result_blocks.append({
-                        "type": "tool_result",
-                        "tool_use_id": result.tool_call_id,
-                        "content": result.content,
-                        "is_error": True,
-                    })
-                    continue
-
-                # 1) Path resolution — out-of-bounds is an error
-                try:
-                    path = resolve_in_cwd(ctx.cwd, path_str)
-                except (ValueError, OSError) as exc:
-                    result = ToolResult(call.id, f"error: {exc}", is_error=True)
-                    emit(f"observation: {result.content}")
-                    tool_result_blocks.append({
-                        "type": "tool_result",
-                        "tool_use_id": result.tool_call_id,
-                        "content": result.content,
-                        "is_error": True,
-                    })
-                    continue
-
-                old_content = path.read_text(encoding="utf-8") if path.exists() else ""
-
-                # 2) Pre-flight validation: read-before-edit + mtime conflict
-                validation_error: str | None = None
-                if call.name == "file_write":
-                    if path.exists():
-                        validation_error = (
-                            ensure_read_before_edit(ctx.read_state, path)
-                            or check_mtime_conflict(ctx.read_state, path)
-                        )
-                else:  # file_edit
-                    if not path.exists():
-                        validation_error = f"error: file does not exist: {path_str}"
-                    else:
-                        validation_error = (
-                            ensure_read_before_edit(ctx.read_state, path)
-                            or check_mtime_conflict(ctx.read_state, path)
-                        )
-
-                # 3) Compute new_content
-                new_content: str | None = None
-                if call.name == "file_write":
-                    new_content = call.arguments.get("content", "")
-                elif call.name == "file_edit" and validation_error is None:
-                    new_content, replace_err = apply_single_replace(
-                        old_content,
-                        call.arguments.get("old_string", ""),
-                        call.arguments.get("new_string", ""),
-                        bool(call.arguments.get("replace_all", False)),
-                    )
-                    if replace_err is not None:
-                        validation_error = replace_err
-
-                # 4) Validation failure → error observation, no diff, no confirm
-                if validation_error is not None:
-                    result = ToolResult(call.id, validation_error, is_error=True)
-                    emit(f"observation: {result.content}")
-                    tool_result_blocks.append({
-                        "type": "tool_result",
-                        "tool_use_id": result.tool_call_id,
-                        "content": result.content,
-                        "is_error": True,
-                    })
-                    continue
-
-                # Store preview for ask/allow branches
-                edit_preview = (path_str, old_content, new_content or "")
-
-            # ── Permission branches ─────────────────────────────
-            if decision.behavior == "deny":
-                result = ToolResult(call.id, f"error: {decision.message}", is_error=True)
-                emit(f"observation: {result.content}")
-                tool_result_blocks.append({
-                    "type": "tool_result",
-                    "tool_use_id": result.tool_call_id,
-                    "content": result.content,
-                    "is_error": True,
-                })
-                continue
-
-            elif decision.behavior == "ask":
-                if call.name in ("file_write", "file_edit") and edit_preview is not None:
-                    path_str, old_content, new_content = edit_preview
-                    diff_text = render_diff(old_content, new_content, path_str)
-                    console.print(f"\n[bold]Diff for {path_str}:[/bold]")
-                    console.print(diff_text)
-                    if not confirm_edit(path_str):
-                        result = ToolResult(call.id, "error: edit rejected by user", is_error=True)
-                        emit(f"observation: {result.content}")
-                        tool_result_blocks.append({
-                            "type": "tool_result",
-                            "tool_use_id": result.tool_call_id,
-                            "content": result.content,
-                            "is_error": True,
-                        })
-                        continue
-
-                elif call.name == "bash":
-                    command = call.arguments.get("command", "")
-                    timeout = call.arguments.get("timeout", 30)
-                    console.print(f"\n[bold yellow]Command:[/bold yellow] {command}")
-                    console.print(f"[dim]timeout: {timeout}s  cwd: {ctx.cwd}[/dim]")
-                    if not confirm_command(command):
-                        result = ToolResult(call.id, "error: command rejected by user", is_error=True)
-                        emit(f"observation: {result.content}")
-                        tool_result_blocks.append({
-                            "type": "tool_result",
-                            "tool_use_id": result.tool_call_id,
-                            "content": result.content,
-                            "is_error": True,
-                        })
-                        continue
-
-                elif call.name in ("web_fetch", "web_search"):
-                    if not confirm_tool_use(call.name, call.arguments):
-                        result = ToolResult(call.id, "error: tool use rejected by user", is_error=True)
-                        emit(f"observation: {result.content}")
-                        tool_result_blocks.append({
-                            "type": "tool_result",
-                            "tool_use_id": result.tool_call_id,
-                            "content": result.content,
-                            "is_error": True,
-                        })
-                        continue
-
-                elif call.name == "ask_user_question":
-                    question = call.arguments.get("prompt", "")
-                    options = call.arguments.get("options", [])
-                    if not isinstance(options, list):
-                        options = []
-                    labels = [str(o) for o in options]
-                    selected = prompt_single_choice(question, labels)
-                    if selected is None:
-                        result = ToolResult(call.id, "User skipped the question.", is_error=False)
-                    else:
-                        result = ToolResult(call.id, f'User selected: "{selected}"', is_error=False)
-                    emit(f"observation: {result.content}")
-                    tool_result_blocks.append({
-                        "type": "tool_result",
-                        "tool_use_id": result.tool_call_id,
-                        "content": result.content,
-                        "is_error": result.is_error,
-                    })
-                    continue
-
-            # ── PreToolUse hooks ─────────────────────────────
-            if decision.behavior != "deny":
-                pre_hooks = run_hooks("PreToolUse", call.name, call.arguments, ctx.cwd)
-                pre_blocked = [h for h in pre_hooks if not h["success"]]
-                if pre_blocked:
-                    blocked_msgs = "\n".join(
-                        f"  [hook] {h['command']}: {h['output']}" for h in pre_blocked
-                    )
-                    observation = f"tool blocked by PreToolUse hook:\n{blocked_msgs}"
-                    emit(f"observation: {observation}")
-                    tool_result_blocks.append({
-                        "type": "tool_result",
-                        "tool_use_id": call.id,
-                        "content": observation,
-                        "is_error": True,
-                    })
-                    continue
-
-            # ── 执行工具 ──────────────────────────────────────
-            result = tools.run(call, ctx)
-            emit(f"observation: {result.content}")
-
-            # ── PostToolUse hooks ────────────────────────────
-            if not result.is_error:
-                post_hooks = run_hooks(
-                    "PostToolUse", call.name, call.arguments, ctx.cwd,
-                    tool_result=result.content,
-                )
-                for h in post_hooks:
-                    status = "ok" if h["success"] else f"warning: {h['output']}"
-                    console.print(f"[dim]hook: PostToolUse {call.name} {status}[/dim]")
-            tool_result_blocks.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": result.tool_call_id,
-                    "content": result.content,
-                    "is_error": result.is_error,
-                }
-            )
         messages.append({"role": "user", "content": tool_result_blocks})
         if session:
             session.append_messages([messages[-1]])

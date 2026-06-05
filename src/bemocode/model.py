@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
-from dataclasses import dataclass
+from collections.abc import Iterator
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 from anthropic import Anthropic
 
@@ -27,6 +28,17 @@ class ModelResponse:
     stop_reason: str = "end_turn"
 
 
+@dataclass
+class StreamEvent:
+    """流式事件：text_delta / tool_use_start / tool_use_delta / done。"""
+    type: str  # "text_delta" | "tool_use_start" | "tool_use_delta" | "done"
+    text: str = ""
+    tool_id: str = ""
+    tool_name: str = ""
+    tool_input: dict[str, Any] = field(default_factory=dict)
+    stop_reason: str = ""
+
+
 class ModelProvider(Protocol):
     def complete(
         self,
@@ -36,10 +48,38 @@ class ModelProvider(Protocol):
     ) -> ModelResponse:
         ...
 
+    def complete_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any] | None = None,
+        system: str | None = None,
+    ) -> Iterator[StreamEvent]:
+        ...
+
 
 class MockProvider:
     def __init__(self) -> None:
         self._last_tool: str = "echo"
+
+    def complete_stream(self, messages: list[dict[str, str]], tools: list[Any] | None = None, system: str | None = None) -> Iterator[StreamEvent]:
+        """Mock streaming — 直接 yield 整个回复，模拟流式的视觉效果。"""
+        import time as _time
+        response = self.complete(messages, tools, system)
+        if response.text:
+            # 逐词 yield，模拟流式输出
+            words = response.text.split()
+            for word in words:
+                yield StreamEvent(type="text_delta", text=word + " ")
+                _time.sleep(0.02)
+        elif response.tool_calls:
+            for tc in response.tool_calls:
+                yield StreamEvent(
+                    type="tool_use_start",
+                    tool_id=tc.id,
+                    tool_name=tc.name,
+                    tool_input=tc.arguments,
+                )
+        yield StreamEvent(type="done", stop_reason=response.stop_reason)
 
     def complete(self, messages: list[dict[str, str]], tools: list[Any] | None = None, system: str | None = None) -> ModelResponse:
         last = messages[-1]
@@ -213,6 +253,50 @@ class AnthropicProvider:
             assistant_content=assistant_content or None,
             stop_reason=response.stop_reason or "end_turn",
         )
+
+    def complete_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any] | None = None,
+        system: str | None = None,
+    ) -> Iterator[StreamEvent]:
+        """流式调用 Anthropic API，逐个 yield StreamEvent。"""
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": messages,
+            "stream": True,
+        }
+        if system is not None:
+            kwargs["system"] = system
+        if tools:
+            kwargs["tools"] = _to_anthropic_tools(tools)
+
+        with self.client.messages.stream(**kwargs) as stream:
+            for event in stream:
+                if event.type == "content_block_delta":
+                    delta = event.delta
+                    if delta.type == "text_delta":
+                        yield StreamEvent(type="text_delta", text=delta.text)
+                    elif delta.type == "input_json_delta":
+                        yield StreamEvent(
+                            type="tool_use_delta",
+                            tool_id="",
+                            text=delta.partial_json,
+                        )
+                elif event.type == "content_block_start":
+                    block = event.content_block
+                    if block.type == "tool_use":
+                        yield StreamEvent(
+                            type="tool_use_start",
+                            tool_id=block.id,
+                            tool_name=block.name,
+                        )
+                elif event.type == "message_delta":
+                    yield StreamEvent(
+                        type="done",
+                        stop_reason=event.delta.stop_reason or "end_turn",
+                    )
 
 
 def create_provider(name: str, model: str, base_url: str | None = None) -> ModelProvider:
